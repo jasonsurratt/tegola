@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/go-spatial/tegola"
+	"github.com/go-spatial/tegola/basic"
 	"github.com/go-spatial/tegola/geom"
 	"github.com/go-spatial/tegola/geom/geos"
 	"github.com/go-spatial/tegola/geom/encoding/geojson"
 	"github.com/go-spatial/tegola/geom/encoding/wkb"
+	"github.com/go-spatial/tegola/geom/encoding/wkt"
 	"github.com/go-spatial/tegola/internal/convert"
 )
 
@@ -36,6 +38,108 @@ type Stats struct {
 	ggTegolaResult geom.Geometry;
 	symDiffPercent float64
 }
+
+
+type ErrorReport interface {
+	Errorf(format string, a ...interface{})
+}
+
+func TestSimpleCrop(t *testing.T) {
+	cases := []struct {
+		tgGeom geom.Geometry
+		ext *geom.Extent
+	} {
+		{
+			// CCW
+			basic.Polygon {
+				basic.Line {
+					basic.Point {0, 0},
+					basic.Point {10, 0},
+					basic.Point {10, 10},
+					basic.Point {0, 10},
+				},
+			},
+			geom.NewExtent([2]float64{0, 0}, [2]float64{10, 5}),
+		},
+		{
+			// CW
+			basic.Polygon { basic.Line{
+					basic.Point {0, 0},
+					basic.Point {0, 10},
+					basic.Point {10, 10},
+					basic.Point {10, 0},
+			} },
+			geom.NewExtent([2]float64{0, 0}, [2]float64{10, 5}),
+		},
+		// Concave result polygon
+		{
+			basic.Polygon { basic.Line {
+					basic.Point {0, 0},
+					basic.Point {10, 0},
+					basic.Point {10, 10},
+					basic.Point {0, 10},
+			} },
+			geom.NewExtent([2]float64{0, 0}, [2]float64{5, 5}),
+		},
+		// Concave input and result polygon
+		{
+			basic.Polygon { basic.Line {
+					basic.Point {0, 0},
+					basic.Point {5, 5},
+					basic.Point {10, 0},
+					basic.Point {10, 10},
+					basic.Point {0, 10},
+			} },
+			geom.NewExtent([2]float64{0, 0}, [2]float64{5, 5}),
+		},
+		// Triangle w/ duplicate start/end
+		{
+			basic.Polygon { basic.Line {
+					basic.Point {0, 0},
+					basic.Point {10, 0},
+					basic.Point {10, 10},
+					basic.Point {0, 0},
+			} },
+			geom.NewExtent([2]float64{0, 0}, [2]float64{5, 5}),
+		},
+		// fractional coordinate
+		// if you multiply everything by 10 (remove fraction), then this test case
+		// works just fine.
+		{
+			basic.Polygon { basic.Line {
+					basic.Point {.1, 0},
+					basic.Point {1, 0},
+					basic.Point {0, 1},
+			} },
+			geom.NewExtent([2]float64{0, 0}, [2]float64{.5, .5}),
+		},
+	}
+
+	gi := geos.NewGeos()
+	defer gi.Finish()
+
+	for _, c := range cases {
+		ggGeom, err := convert.ToGeom(c.tgGeom)
+		if err != nil {
+			t.Errorf("Error converting to geom: %v", err)
+		}
+
+		gsGeom, err := gi.FromGoGeom(ggGeom)
+		if err != nil {
+			t.Errorf("Error converting to GEOS: %v", err)
+		}
+
+		stats := RunOneBenchmarkCleanGeometry(t, c.ext, ggGeom, c.tgGeom, gsGeom, gi)
+		fmt.Println("geosCoordCount: ", stats.geosCoordCount)
+		fmt.Println("tegolaCoordCount: ", stats.geosCoordCount)
+		fmt.Println("symDiffPercent: ", stats.symDiffPercent)
+		if (stats.symDiffPercent > 0) {
+			fmt.Println(wkt.Encode(stats.ggGeosResult))
+			fmt.Println(wkt.Encode(stats.ggTegolaResult))
+		}
+	}
+}
+
 
 /**
  * Dump the collected benchmarking statistics to a GeoJSON file and to stdout as a TSV.
@@ -202,14 +306,18 @@ func RunBenchmarkCleanGeometry(b *testing.B, rng *rand.Rand, fname string, stats
 	gi := geos.NewGeos()
 	defer gi.Finish()
 
-	geosGeom, err := gi.FromGoGeom(g)
+	gsGeom, err := gi.FromGoGeom(g)
 	if err != nil {
 		b.Errorf("Error converting geometry to geos: %v", err)
 	}
 
 	result := stats
 	for i := 0; i < 20; i++ {
-		result = RunOneBenchmarkCleanGeometry(b, rng, fname, result, g, tegGeom, geosGeom, gi)
+		// Create a random bounding box for intersection
+		ext := CreateRandomExtent(rng, gsGeom)
+		s := RunOneBenchmarkCleanGeometry(b, ext, g, tegGeom, gsGeom, gi)
+		s.filename = fname
+		result = append(result, s)
 	}
 
 	return result
@@ -229,13 +337,9 @@ func RunBenchmarkCleanGeometry(b *testing.B, rng *rand.Rand, fname string, stats
  * - tg - Tegola Geometry
  * - gs - GeoS Geometry
  */
-func RunOneBenchmarkCleanGeometry(b *testing.B, rng *rand.Rand, fname string, stats []Stats, ggGeom geom.Geometry, tgGeom tegola.Geometry, gsGeom *geos.Geom, gi *geos.Geos) []Stats {
+func RunOneBenchmarkCleanGeometry(b ErrorReport, ext *geom.Extent, ggGeom geom.Geometry, tgGeom tegola.Geometry, gsGeom *geos.Geom, gi *geos.Geos) Stats {
 	var result Stats
-	result.filename = fname
 	result.ggOriginal = ggGeom
-
-	// Create a random bounding box for intersection
-	ext := CreateRandomExtent(rng, gsGeom)
 
 	// calculate the area of the intersecting box
 	result.extentArea = ext.XSpan() * ext.YSpan()
@@ -294,7 +398,7 @@ func RunOneBenchmarkCleanGeometry(b *testing.B, rng *rand.Rand, fname string, st
 		result.symDiffPercent = -1
 	}
 
-	return append(stats, result)
+	return result
 }
 
 
